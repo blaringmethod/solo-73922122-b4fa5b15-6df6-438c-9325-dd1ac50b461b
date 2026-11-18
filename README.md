@@ -27,6 +27,43 @@ volume** with a **128 MiB memory limit**.
 * Snapshots freeze the published lane list at creation time. Sample/
   quarantine downloads through a snapshot only ever concatenate files from
   that fixed list — lanes published later never mix in.
+* A **sampling endpoint** draws a deterministic subset of a sample's read
+  pairs from a snapshot for trial alignment, spreading the quota across
+  lanes so high-throughput lanes cannot hog it (see below).
+
+## Snapshot sampling (trial alignment)
+
+`GET /snapshots/{id}/samples/{sample_id}/sample?seed=...&pairs=1..200`
+
+Draws up to `pairs` read pairs of one sample from the snapshot's frozen
+lane list and returns per-lane hit counts plus the paired-end FASTQ text
+(`r1_fastq` / `r2_fastq`, positionally paired, lanes in snapshot order,
+pairs in original file order within each lane).
+
+Allocation of the pair quota:
+
+* If the target covers every non-empty lane, each contributes **at least
+  one pair**; otherwise the earliest lanes in snapshot order are covered
+  with one pair each until the target is spent.
+* The remaining quota is split **in proportion to each lane's published
+  read-pair count**; rounding remainders and shares a lane cannot absorb
+  (capacity shortfall) are filled in snapshot order.
+* The grand total is `min(target, pairs actually available)`.
+
+Within a lane the draw is an index sample keyed by a per-lane hash of the
+request `seed`, so **identical requests return identical results** (verified
+byte-identical across both container instances) and duplicate read names in
+one lane each occupy their own slot.
+
+Integrity: every contributing lane is fully re-scanned — read names, paired
+format and the published pair count are verified, and each mate's sequence/
+quality lines must be ≤ 1000 bytes and read names ≤ 256 bytes. (Record
+lines, headers included, are read with a 1000-byte bound so a pathological
+single-line file cannot be buffered whole.) A missing file, corruption,
+count mismatch or over-limit line fails the **whole request** with `409`. Per-lane decompressed data may reach 512 MiB and is
+streamed record-by-record (bounded line reads), so the 128 MiB container
+limit is respected; the scan runs in the threadpool, so other lanes keep
+being served meanwhile.
 
 ## Running (Docker Compose, two instances on a shared volume)
 
@@ -51,6 +88,10 @@ python scripts/make_demo_fastq.py /tmp/demo          # makes R1/R2.fastq.gz
 curl http://localhost:8001/lanes/demoLane             # counts
 curl -OJ http://localhost:8001/lanes/demoLane/samples/sampleA/r1
 curl -OJ http://localhost:8001/lanes/demoLane/quarantine/r1
+
+# Deterministic sampling for trial alignment (also try on :8002 — identical):
+SNAP=$(curl -s -X POST http://localhost:8001/snapshots | python -c 'import json,sys; print(json.load(sys.stdin)["snapshot_id"])')
+curl -s "http://localhost:8001/snapshots/$SNAP/samples/sampleA/sample?seed=run1&pairs=5"
 ```
 
 ## API surface
@@ -66,6 +107,7 @@ curl -OJ http://localhost:8001/lanes/demoLane/quarantine/r1
 | POST | `/snapshots` | Freeze the current published lane list |
 | GET | `/snapshots`, `/snapshots/{id}` | List/inspect snapshots |
 | GET | `/snapshots/{id}/samples/{sample_id}/{mate}` | Snapshot-scoped concatenated download |
+| GET | `/snapshots/{id}/samples/{sample_id}/sample` | Deterministic read-pair sampling (`seed`, `pairs` 1–200) |
 | GET | `/snapshots/{id}/quarantine/{mate}` | Snapshot-scoped quarantine download |
 | GET | `/health` | Liveness, instance id, current job, queue depth |
 
@@ -94,10 +136,11 @@ data with RSS growth below 64 MiB.
 ## Layout
 
 ```
-app/            FastAPI app, SQLite layer, streaming splitter, worker
+app/            FastAPI app, SQLite layer, streaming splitter, worker,
+                snapshot sampling (allocation + seeded draw)
 scripts/        demo FASTQ generator, two-instance integration check
 tests/          pytest suite (happy path, corruption, retry, recovery,
-                barcode rules, size budget, streaming memory)
+                barcode rules, size budget, streaming memory, sampling)
 Dockerfile      python:3.11-slim, non-root user, /data volume, healthcheck
 docker-compose.yml  two 128 MiB instances sharing one named volume
 ```

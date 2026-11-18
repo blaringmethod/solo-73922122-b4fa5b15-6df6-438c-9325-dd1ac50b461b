@@ -39,14 +39,34 @@ class Record:
     qual: bytes   # qualities only, raw Phred+33 bytes
 
 
-def _read_record(gf: gzip.GzipFile, mate: str, index: int) -> Record | None:
+def _readline_bounded(gf: gzip.GzipFile, limit: int | None, mate: str,
+                      index: int, label: str) -> bytes:
+    """Read one line; when limit is set, cap content at limit bytes.
+
+    Reading with a size hint keeps a pathological single-line file from
+    being buffered whole (memory safety in the 128 MiB container).
+    """
+    if limit is None:
+        return gf.readline()
+    line = gf.readline(limit + 2)
+    # len == limit+2: content already exceeds the limit (with or without the
+    # newline read). len == limit+1 without a newline: content is limit+1.
+    if len(line) > limit + 1 or (len(line) == limit + 1
+                                 and not line.endswith(b"\n")):
+        raise FastqFormatError(
+            f"{mate}: record {index} {label} line exceeds {limit} bytes")
+    return line
+
+
+def _read_record(gf: gzip.GzipFile, mate: str, index: int,
+                 line_limit: int | None = None) -> Record | None:
     """Read and validate one FASTQ record. Returns None at clean EOF."""
-    name = gf.readline()
+    name = _readline_bounded(gf, line_limit, mate, index, "header")
     if name == b"":
         return None
-    seq_line = gf.readline()
-    plus_line = gf.readline()
-    qual_line = gf.readline()
+    seq_line = _readline_bounded(gf, line_limit, mate, index, "sequence")
+    plus_line = _readline_bounded(gf, line_limit, mate, index, "plus")
+    qual_line = _readline_bounded(gf, line_limit, mate, index, "quality")
     if not name.startswith(b"@") or seq_line == b"" or not plus_line.startswith(b"+"):
         raise FastqFormatError(
             f"{mate}: record {index} is not a well-formed FASTQ record")
@@ -73,7 +93,9 @@ def _read_record(gf: gzip.GzipFile, mate: str, index: int) -> Record | None:
 
 
 def _paired_records(r1_path: Path, r2_path: Path,
-                    size_budget: int) -> Iterator[tuple[Record, Record]]:
+                    size_budget: int,
+                    line_limit: int | None = None
+                    ) -> Iterator[tuple[Record, Record]]:
     """Yield validated R1/R2 pairs, enforcing name/order equality and budget."""
     used = 0
     with open(r1_path, "rb") as f1, open(r2_path, "rb") as f2:
@@ -82,8 +104,8 @@ def _paired_records(r1_path: Path, r2_path: Path,
                 index = 0
                 while True:
                     try:
-                        r1 = _read_record(g1, "R1", index)
-                        r2 = _read_record(g2, "R2", index)
+                        r1 = _read_record(g1, "R1", index, line_limit)
+                        r2 = _read_record(g2, "R2", index, line_limit)
                     except (OSError, EOFError, zlib.error) as exc:
                         raise FastqFormatError(f"gzip stream corrupted: {exc}") from exc
                     if r1 is None and r2 is None:

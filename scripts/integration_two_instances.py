@@ -213,7 +213,46 @@ def main() -> int:
         assert set(json.loads(snap2)["lanes"]) == before
         print(f"    snapshot keeps {len(before)} lanes; later lane excluded")
 
-        print("[5] duplicate lane reuses task; different input rejected (409)")
+        print("[5] snapshot sampling: deterministic across both instances")
+        params = "seed=it-seed-7&pairs=27"
+        code, body_a = http(
+            "GET", f"{BASE_A}/snapshots/{snap_id}/samples/sampleA/sample?{params}")
+        assert code == 200, (code, body_a)
+        code, body_b = http(
+            "GET", f"{BASE_B}/snapshots/{snap_id}/samples/sampleA/sample?{params}")
+        assert code == 200, (code, body_b)
+        assert body_a == body_b, "identical requests must match across instances"
+        draw = json.loads(body_a)
+        assert draw["returned_pairs"] == 27
+        assert draw["requested_pairs"] == 27
+        per_lane = {l["lane"]: l["selected_pairs"] for l in draw["lanes"]}
+        assert sum(per_lane.values()) == 27
+        # 9 non-empty lanes < 27 pairs: every lane contributes at least one.
+        assert len(per_lane) == 9 and all(n >= 1 for n in per_lane.values())
+        r1_lines = draw["r1_fastq"].strip().split("\n")
+        r2_lines = draw["r2_fastq"].strip().split("\n")
+        assert len(r1_lines) == len(r2_lines) == 27 * 4
+        for i in range(0, len(r1_lines), 4):
+            # Read-name tokens match; header comments may differ per mate.
+            assert r1_lines[i].split()[0] == r2_lines[i].split()[0]
+            assert r1_lines[i].startswith("@")
+            assert r1_lines[i + 2] == "+" and r2_lines[i + 2] == "+"
+            assert len(r1_lines[i + 1]) == len(r1_lines[i + 3])
+        # Total is capped by what the snapshot actually holds.
+        code, small = http(
+            "GET", f"{BASE_A}/snapshots/{snap_id}/samples/sampleA/sample"
+                   "?seed=it-seed-7&pairs=200")
+        assert json.loads(small)["returned_pairs"] == 200
+        # Target range is validated.
+        for bad in ("pairs=0", "pairs=201"):
+            code, _ = http(
+                "GET", f"{BASE_A}/snapshots/{snap_id}/samples/sampleA/sample"
+                       f"?seed=x&{bad}")
+            assert code == 422, (bad, code)
+        print(f"    27 pairs over 9 lanes: {sorted(per_lane.values())}; "
+              "A and B byte-identical")
+
+        print("[6] duplicate lane reuses task; different input rejected (409)")
         boundary, body = multipart("laneIT0", barcodes, r1, r2)
         code, resp = http("POST", f"{BASE_B}/jobs", raw_path=(boundary, body))
         assert code == 201 and json.loads(resp)["reused"] is True
@@ -225,12 +264,12 @@ def main() -> int:
         signalled = [stop(p) for p in procs]
 
     if not all(signalled):
-        print("\n[6] SKIPPED hard-crash section: sandbox denies process signals")
+        print("\n[7] SKIPPED hard-crash section: sandbox denies process signals")
         print("    Crash recovery is covered by: pytest tests/test_failure_and_recovery.py")
         print("\nINTEGRATION CHECKS PASSED (crash section skipped here)")
         return 0
 
-    print("[6] hard-crash recovery (SIGKILL mid-lane, restart cleanup)")
+    print("[7] hard-crash recovery (SIGKILL mid-lane, restart cleanup)")
     c = start_instance(PORT_A, data_dir)
     try:
         boundary, body = multipart("laneCrash", barcodes, r1, r2)

@@ -37,5 +37,10 @@ MAX_TOTAL_UNCOMPRESSED = 512 * 1024 * 1024  # 512 MiB across both mates
 HEARTBEAT_FLUSH_EVERY = 256  # records between heartbeat writes
 POLL_INTERVAL = float(os.environ.get("DEMUX_POLL_INTERVAL", "1.0"))
 
+# Snapshot sampling API limits.
+MAX_SAMPLE_PAIRS = 200        # target read pairs per sampling request
+SAMPLE_MAX_LINE = 1000        # seq/qual line cap per mate (bytes, no newline)
+SAMPLE_MAX_NAME = 256         # read name cap (bytes, first header token)
+
 for _d in (DATA_DIR, INCOMING_DIR, WORK_DIR, PUBLISHED_DIR):
     _d.mkdir(parents=True, exist_ok=True)

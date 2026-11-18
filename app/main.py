@@ -11,10 +11,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 
-from . import config, db, processing
+from . import config, db, processing, sampling
 from .worker import JobWorker, new_instance_id
 
 _IO_CHUNK = 1024 * 1024
@@ -370,6 +370,28 @@ def _iter_concat(files: list[Path]):
                 if not chunk:
                     break
                 yield chunk
+
+
+# NOTE: registered before /snapshots/{id}/samples/{sample_id}/{mate} so the
+# literal "sample" segment is not swallowed by the {mate} path parameter.
+@app.get("/snapshots/{snapshot_id}/samples/{sample_id}/sample")
+def sample_pairs(snapshot_id: str, sample_id: str,
+                 seed: str = Query(..., min_length=1, max_length=128),
+                 pairs: int = Query(..., ge=1, le=config.MAX_SAMPLE_PAIRS)):
+    """Deterministically draw up to ``pairs`` read pairs of one sample from
+    a snapshot's frozen lane list, for trial alignment. Sync endpoint: the
+    decompression scan runs in the threadpool, so uploads, queries and the
+    background worker keep serving other lanes meanwhile."""
+    snap = db.get_snapshot(snapshot_id)
+    if snap is None:
+        raise HTTPException(404, "snapshot not found")
+    try:
+        result = sampling.sample_snapshot(snap, sample_id, seed, pairs)
+    except sampling.SampleDataError as exc:
+        raise HTTPException(409, str(exc))
+    if result is None:
+        raise HTTPException(404, f"sample {sample_id!r} absent from snapshot")
+    return result
 
 
 @app.get("/snapshots/{snapshot_id}/samples/{sample_id}/{mate}")
